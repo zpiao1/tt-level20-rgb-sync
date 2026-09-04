@@ -1,0 +1,14 @@
+# Machine-state snapshots from snapshot.ps1 — a full inventory of this PC
+# (installed programs, services, drivers, autoruns, listening ports, registry).
+# Local rollback aid only; never publish.
+baseline/
+
+# Runtime output
+sync.log
+
+# Python build residue
+__pycache__/
+*.pyc
+
+# Session scratch
+.remember/
