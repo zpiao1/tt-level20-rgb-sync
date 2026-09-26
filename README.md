@@ -1,17 +1,20 @@
 # tt-keyboard-sync
 
 Drives the **Thermaltake Level 20 RGB** (`KB-LVT-SSBRUS-01`) backlight from the
-current desktop wallpaper. Talks to the keyboard directly over USB HID — no
+Windows accent colour (or the desktop wallpaper). Talks to the keyboard directly over USB HID — no
 Thermaltake, Razer, or SignalRGB software involved at runtime.
 
 ## Usage
 
 ```
-python sync.py --reactive          # wallpaper sync + keypress pulse
-python sync.py                     # wallpaper sync only
+python sync.py --reactive          # accent sync + keypress pulse
+python sync.py                     # accent sync only
+python sync.py --source wallpaper  # follow the wallpaper instead
 python sync.py --once              # apply current colour and exit
 python sync.py --reactive --boost 0.9 --decay 0.20
-python wallpaper.py                # print the colour that would be used
+python accent.py                   # print accent colour and its LED version
+python wallpaper.py                # same, for the wallpaper pick
+python -m unittest test_color -v   # colour-logic tests
 python tt_level20.py               # hardware self-test: red/green/blue/amber
 python reactive.py                 # visualise the pulse envelope in the terminal
 ```
@@ -30,14 +33,64 @@ the process holds loopback port 49731 as a lock.
 |---|---|
 | `tt_level20.py` | USB HID driver for `264A:3017` |
 | `leds.py`       | LED index groups (keys, logos, centre strip, outer frame) |
-| `wallpaper.py`  | Finds current wallpaper, extracts an accent colour |
-| `reactive.py`   | Keypress listener + pulse envelope |
-| `sync.py`       | Ties it together; watches wallpaper, renders pulse |
+| `accent.py`     | Reads the Windows accent colour from the registry |
+| `wallpaper.py`  | Finds current wallpaper, extracts a dominant colour |
+| `ledcolor.py`   | Adapts any source colour for LED display |
+| `reactive.py`   | Keypress listener + hue-preserving pulse |
+| `watchers.py`   | Win32 change notifications (registry key / folder) |
+| `sync.py`       | Ties it together; waits for events, renders pulse |
+
+### Colour sources
+
+`--source accent` (default) reads entry 3 of
+`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Accent\AccentPalette`
+(eight RGBA shades, light to dark). Entry 3 is byte-for-byte what Windows' own
+`UISettings.GetColorValue(UIColorType.Accent)` returns. With *Automatically pick
+an accent color from my background* enabled, Windows recomputes it whenever the
+wallpaper slideshow rotates.
+
+Don't use `DWM\AccentColor` for this. It looks like the accent and often
+matches it, but it's the title-bar colourization value. On this machine it
+stayed on a stale colour and snapped back to it ~50ms after each accent
+change, so an earlier version briefly showed the new colour and then reverted.
+
+`--source wallpaper` uses this project's own pick: median-cut the wallpaper into
+16 buckets, score each on `frequency x saturation x brightness`.
+
+### Event-driven updates
+
+Nothing is polled in normal operation. `RegNotifyChangeKeyValue` on the Accent
+key (the same mechanism Chrome uses to follow the accent) and
+`FindFirstChangeNotification` on the Themes folder wake the loop the moment
+Windows writes a change - measured at ~40ms from the registry write to the
+keyboard repainting.
+
+A notification only means *something* under that key/folder changed, so each
+source also has a cheap change token (palette bytes / file mtime); the keyboard
+is repainted only when the token actually differs. The wallpaper source also
+waits for the file to stop changing before decoding it, so a burst of writes
+while Windows transcodes produces one repaint, not several.
+
+The main loop blocks on a single event set by the colour watcher and by the
+keypress listener, so at rest it uses no CPU at all, and a keypress starts the
+pulse immediately. `--interval` is only a safety re-check (default 60s) in case
+a notification is ever missed, e.g. across sleep/resume; if notifications
+can't be registered at all it falls back to polling every 2s.
+
+### LED adaptation
+
+Every source colour passes through `normalize_for_leds()` before reaching the
+keyboard: saturation floored at 45%, brightness clamped to 55–80%. Hue is never
+changed. Dark colours look muddy on LEDs, and colours near full brightness
+leave the pulse no headroom. So the keyboard deliberately does *not* show the
+exact source value — e.g. `#69250C` is displayed as `#8C3110`.
 
 ### Reactive pulse
 
 `--reactive` brightens the 34 outer-frame LEDs on each keypress and decays back
-over roughly 250ms. The two logo LEDs (`0xB1`, `0xB2`) are deliberately excluded
+over roughly 250ms. The boost is hue-preserving: the multiplier is capped at
+`255 / max(channel)` so all channels rise and stop together, rather than the
+brightest channel saturating while the others keep climbing and shift the hue. The two logo LEDs (`0xB1`, `0xB2`) are deliberately excluded
 so branding stays steady. Held keys pulse once: Windows auto-repeat is
 suppressed by firing only on the up->down transition.
 

@@ -1,19 +1,24 @@
 """
-Keep the Thermaltake Level 20 RGB backlight matching the desktop wallpaper,
-optionally pulsing the outer light frame on every keypress.
+Keep the Thermaltake Level 20 RGB backlight matching the Windows accent colour
+(or the desktop wallpaper), optionally pulsing the outer light frame on every
+keypress.
 
-    python sync.py                  # wallpaper sync only
-    python sync.py --reactive       # + brightness pulse on keypress
-    python sync.py --once           # apply current colour and exit
+    python sync.py                        # follow the Windows accent colour
+    python sync.py --source wallpaper     # follow the wallpaper instead
+    python sync.py --reactive             # + brightness pulse on keypress
+    python sync.py --once                 # apply current colour and exit
     python sync.py --reactive --boost 0.9 --decay 0.18
 """
 import argparse
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 
+import accent
 import wallpaper
+from ledcolor import hexcolor, normalize_for_leds
 from leds import OUTER_FRAME
 from reactive import KeypressWatcher, PulseEnvelope, boost
 from tt_level20 import Level20
@@ -23,16 +28,24 @@ from tt_level20 import Level20
 # keyboard. The socket is never read from or written to.
 SINGLE_INSTANCE_PORT = 49731
 
-IDLE_TICK = 0.05      # seconds between polls when nothing is animating
-FRAME_TICK = 1 / 60   # target cadence while a pulse is decaying
+FRAME_TICK = 1 / 60          # target cadence while a pulse is decaying
+RECHECK_WITH_WATCHER = 60.0  # safety re-check when change notifications work
+RECHECK_WITHOUT = 2.0        # poll interval if notifications are unavailable
 LEVEL_EPSILON = 0.02  # smallest brightness change worth a USB write
+
+# Each source offers token() - a cheap value that changes when the colour
+# does (registry DWORD / file mtime) - color(), the possibly-expensive read of
+# the actual colour, and watcher(), a Win32 change notification. The watcher
+# wakes the loop instantly; the token comparison then decides whether the
+# colour really changed (the watched key/folder holds other things too).
+SOURCES = {"accent": accent, "wallpaper": wallpaper}
 
 
 _log_file = None
 
 
 def log(msg):
-    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S.%f}"[:-3] + f"] {msg}"
     print(line, flush=True)
     if _log_file is not None:
         try:
@@ -54,6 +67,12 @@ def acquire_single_instance():
         return None
 
 
+def read_base(source):
+    """Return (raw, led) - the source colour and its LED-adapted version."""
+    raw = source.color()
+    return raw, normalize_for_leds(raw)
+
+
 def connect():
     kb = Level20()
     kb.enter_software_mode()
@@ -63,8 +82,12 @@ def connect():
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--interval", type=float, default=10.0,
-                    help="seconds between wallpaper checks (default 10)")
+    ap.add_argument("--source", choices=sorted(SOURCES), default="accent",
+                    help="colour source (default: accent)")
+    ap.add_argument("--interval", type=float, default=None,
+                    help="seconds between safety re-checks of the colour "
+                         "(default 60, or 2 if change notifications are "
+                         "unavailable)")
     ap.add_argument("--once", action="store_true", help="apply once and exit")
     ap.add_argument("--reactive", action="store_true",
                     help="pulse the outer frame on keypress")
@@ -92,52 +115,76 @@ def main():
         return 1
     log("keyboard opened, software mode active")
 
-    base = wallpaper.dominant_color()
+    source = SOURCES[args.source]
+    raw, base = read_base(source)
     kb.set_solid(*base)
-    log(f"base rgb{base}  #{base[0]:02X}{base[1]:02X}{base[2]:02X}")
+    log(f"{args.source} {hexcolor(raw)} -> led {hexcolor(base)}")
     if args.once:
         kb.close()
         return 0
 
+    # Everything that should make the loop act - a colour-change notification
+    # or a keypress - sets this one event. At rest the loop blocks on it, so
+    # there are no idle wakeups and reactions start immediately.
+    wake = threading.Event()
+    # Set only by the colour watcher, so keypresses and pulse frames don't
+    # re-read the colour source - only a notification or a re-check does.
+    colour_dirty = threading.Event()
+
+    def on_colour_change():
+        colour_dirty.set()
+        wake.set()
+
+    colour_watcher = source.watcher(on_colour_change)
+    try:
+        colour_watcher.start()
+        interval = args.interval or RECHECK_WITH_WATCHER
+        mode = f"event-driven, safety re-check every {interval:g}s"
+    except OSError as exc:
+        colour_watcher = None
+        interval = args.interval or RECHECK_WITHOUT
+        mode = f"notifications unavailable ({exc}); polling every {interval:g}s"
+
     envelope = watcher = None
     if args.reactive:
         envelope = PulseEnvelope(decay_tau=args.decay)
-        watcher = KeypressWatcher(envelope)
+        watcher = KeypressWatcher(envelope, on_press=wake.set)
         watcher.start()
         log(f"reactive pulse on ({len(OUTER_FRAME)} outer LEDs, "
             f"boost {args.boost:g}, decay {args.decay:g}s)")
 
-    last_mtime = wallpaper.mtime()
-    last_check = time.monotonic()
+    last_token = source.token()
     last_level = 0.0
-    log(f"watching wallpaper every {args.interval:g}s (Ctrl+C to stop)")
+    recheck = False
+    log(f"watching {args.source} ({mode})")
 
     try:
         while True:
-            now = time.monotonic()
+            # Clear before reading state: anything that fires from here on
+            # leaves the event set, so the wait below returns at once.
+            wake.clear()
 
-            if now - last_check >= args.interval:
-                last_check = now
-                current = wallpaper.mtime()
-                if current is not None and current != last_mtime:
-                    last_mtime = current
-                    try:
-                        base = wallpaper.dominant_color()
-                        kb.set_solid(*base)
-                        last_level = 0.0
-                        log(f"wallpaper changed -> rgb{base}  "
-                            f"#{base[0]:02X}{base[1]:02X}{base[2]:02X}")
-                    except Exception as exc:
-                        log(f"  wallpaper update failed: {exc}")
+            if recheck or colour_dirty.is_set():
+                colour_dirty.clear()
+                recheck = False
+                current = source.token()
+            else:
+                current = last_token
+            if current is not None and current != last_token:
+                last_token = current
+                try:
+                    raw, base = read_base(source)
+                    kb.set_solid(*base)
+                    last_level = 0.0
+                    log(f"{args.source} changed -> {hexcolor(raw)} "
+                        f"-> led {hexcolor(base)}")
+                except Exception as exc:
+                    log(f"  {args.source} update failed: {exc}")
 
-            if envelope is None:
-                time.sleep(IDLE_TICK)
-                continue
-
-            level = envelope.level()
-            if abs(level - last_level) >= LEVEL_EPSILON or (
-                level < LEVEL_EPSILON < last_level
-            ):
+            level = envelope.level() if envelope is not None else 0.0
+            pulse_moved = (abs(level - last_level) >= LEVEL_EPSILON
+                           or level < LEVEL_EPSILON < last_level)
+            if pulse_moved:
                 lit = boost(base, level, args.boost)
                 try:
                     kb.set_leds({i: lit for i in OUTER_FRAME})
@@ -152,13 +199,20 @@ def main():
                     kb.set_solid(*base)
                     last_level = 0.0
 
-            time.sleep(FRAME_TICK if level >= LEVEL_EPSILON else IDLE_TICK)
+            if level >= LEVEL_EPSILON:
+                time.sleep(FRAME_TICK)          # pulse decaying: keep animating
+            else:
+                # At rest: block until woken. A timeout means nothing fired
+                # for a whole interval, so re-check the colour just in case.
+                recheck = not wake.wait(interval)
 
     except KeyboardInterrupt:
         log("stopped")
     finally:
         if watcher is not None:
             watcher.stop()
+        if colour_watcher is not None:
+            colour_watcher.stop()
         try:
             kb.close()
         except Exception:

@@ -1,8 +1,9 @@
-"""Locate the current desktop wallpaper and pull a usable accent colour from it."""
-import colorsys
+"""Locate the current desktop wallpaper and pull a usable colour from it."""
 import os
+import time
 
-from PIL import Image
+from ledcolor import to_hsv
+from watchers import DirectoryWatcher
 
 # Windows re-transcodes whatever the current wallpaper is (slideshow included)
 # into this single file, so its mtime is a reliable change signal.
@@ -13,16 +14,36 @@ WALLPAPER_PATH = os.path.join(
 SAMPLE_SIZE = (200, 125)   # plenty for colour statistics, cheap to process
 PALETTE_SIZE = 16          # median-cut buckets to consider
 
-# Keyboard LEDs wash out muted colours, so refuse to emit anything too grey/dark.
-MIN_SATURATION = 0.45
-MIN_VALUE = 0.55
+# A folder notification can fire several times while Windows is still writing
+# the file; decoding each time wastes work and may read a half-written image.
+SETTLE_SECONDS = 0.3
+SETTLE_TIMEOUT = 3.0
 
 
-def mtime():
+def token():
+    """File mtime - changes whenever Windows re-transcodes a new wallpaper."""
     try:
         return os.path.getmtime(WALLPAPER_PATH)
     except OSError:
         return None
+
+
+def watcher(on_change):
+    """Fires on_change when anything in the Themes folder is written."""
+    return DirectoryWatcher(os.path.dirname(WALLPAPER_PATH), on_change)
+
+
+def color():
+    """Wait for the file to stop changing, then pick its dominant colour."""
+    deadline = time.monotonic() + SETTLE_TIMEOUT
+    last = token()
+    while time.monotonic() < deadline:
+        time.sleep(SETTLE_SECONDS)
+        current = token()
+        if current == last:
+            break
+        last = current
+    return dominant_color()
 
 
 def _score(fraction, saturation, value):
@@ -39,6 +60,8 @@ def _score(fraction, saturation, value):
 
 def dominant_color(path=WALLPAPER_PATH):
     """Return (r, g, b) - the most characteristic vivid colour in the wallpaper."""
+    from PIL import Image      # lazy: only the wallpaper source needs PIL
+
     with Image.open(path) as im:
         im = im.convert("RGB")
         im.thumbnail(SAMPLE_SIZE, Image.Resampling.BILINEAR)
@@ -52,25 +75,16 @@ def dominant_color(path=WALLPAPER_PATH):
     best, best_score = (128, 128, 128), -1.0
     for count, idx in counts:
         r, g, b = palette[idx * 3: idx * 3 + 3]
-        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        _, s, v = to_hsv((r, g, b))
         sc = _score(count / total, s, v)
         if sc > best_score:
             best, best_score = (r, g, b), sc
 
-    return _make_vivid(best)
-
-
-def _make_vivid(rgb):
-    """Nudge the colour up to a floor of saturation/brightness for LED display."""
-    r, g, b = rgb
-    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-    s = max(s, MIN_SATURATION)
-    v = max(v, MIN_VALUE)
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    return (round(r * 255), round(g * 255), round(b * 255))
+    return best
 
 
 if __name__ == "__main__":
+    from ledcolor import hexcolor, normalize_for_leds
     print(f"wallpaper: {WALLPAPER_PATH}")
-    rgb = dominant_color()
-    print(f"dominant : rgb{rgb}  #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}")
+    raw = dominant_color()
+    print(f"dominant : {hexcolor(raw)}  ->  led: {hexcolor(normalize_for_leds(raw))}")

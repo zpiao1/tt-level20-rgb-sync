@@ -57,8 +57,9 @@ class KeypressWatcher:
     are dropped on release - key identity is not used for anything else.
     """
 
-    def __init__(self, envelope):
+    def __init__(self, envelope, on_press=None):
         self.envelope = envelope
+        self.on_press = on_press        # e.g. wakes the idle render loop
         self._listener = None
         self._held = set()
         self._lock = threading.Lock()
@@ -69,6 +70,8 @@ class KeypressWatcher:
                 return
             self._held.add(key)
         self.envelope.trigger()
+        if self.on_press is not None:
+            self.on_press()
 
     def _on_release(self, key):
         with self._lock:
@@ -86,8 +89,17 @@ class KeypressWatcher:
 
 
 def boost(rgb, level, amount):
-    """Scale a colour's brightness by (1 + level*amount), clamped per channel."""
-    factor = 1.0 + level * amount
+    """Brighten a colour by up to (1 + level*amount) without changing its hue.
+
+    Clamping each channel to 255 independently would let the dimmer channels
+    keep rising after the brightest one saturates, shifting the hue on every
+    keystroke. Capping the factor at 255/max(channel) scales all channels
+    together and stops them together.
+    """
+    peak = max(rgb)
+    if peak == 0:
+        return tuple(rgb)
+    factor = min(1.0 + level * amount, 255 / peak)
     return tuple(min(255, round(c * factor)) for c in rgb)
 
 
