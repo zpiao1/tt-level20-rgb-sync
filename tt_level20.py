@@ -85,11 +85,13 @@ class Level20:
         return self._send_payload(payload)
 
     def set_leds(self, colors_by_index, flush=True):
-        """Update specific LEDs. Only reports containing them are resent."""
+        """Update LEDs. Only reports containing an LED whose colour actually
+        changed are resent, so callers can always pass a whole frame."""
+        changed = [i for i, rgb in colors_by_index.items() if self.state.get(i) != rgb]
         self.state.update(colors_by_index)
         if not flush:
             return []
-        return [self._send_report(n) for n in reports_touching(colors_by_index)]
+        return [self._send_report(n) for n in reports_touching(changed)]
 
     def set_solid(self, r, g, b):
         """Paint every LED the same colour."""

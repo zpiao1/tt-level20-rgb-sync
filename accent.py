@@ -53,5 +53,6 @@ def color():
 
 if __name__ == "__main__":
     from ledcolor import hexcolor, normalize_for_leds
+    from render import describe
     raw = color()
-    print(f"accent: {hexcolor(raw)}  ->  led: {hexcolor(normalize_for_leds(raw))}")
+    print(f"accent: {hexcolor(raw)}  ->  {describe(normalize_for_leds(raw))}")

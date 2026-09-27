@@ -88,21 +88,6 @@ class KeypressWatcher:
             self._listener.stop()
 
 
-def boost(rgb, level, amount):
-    """Brighten a colour by up to (1 + level*amount) without changing its hue.
-
-    Clamping each channel to 255 independently would let the dimmer channels
-    keep rising after the brightest one saturates, shifting the hue on every
-    keystroke. Capping the factor at 255/max(channel) scales all channels
-    together and stops them together.
-    """
-    peak = max(rgb)
-    if peak == 0:
-        return tuple(rgb)
-    factor = min(1.0 + level * amount, 255 / peak)
-    return tuple(min(255, round(c * factor)) for c in rgb)
-
-
 if __name__ == "__main__":
     env = PulseEnvelope()
     watcher = KeypressWatcher(env)

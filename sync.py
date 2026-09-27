@@ -8,6 +8,7 @@ keypress.
     python sync.py --reactive             # + brightness pulse on keypress
     python sync.py --once                 # apply current colour and exit
     python sync.py --reactive --boost 0.9 --decay 0.18
+    python sync.py --fade 2.5             # slower colour transitions (0 = snap)
 """
 import argparse
 import socket
@@ -18,9 +19,10 @@ from datetime import datetime
 
 import accent
 import wallpaper
-from ledcolor import hexcolor, normalize_for_leds
+from ledcolor import Fade, hexcolor, normalize_for_leds
 from leds import OUTER_FRAME
-from reactive import KeypressWatcher, PulseEnvelope, boost
+from reactive import KeypressWatcher, PulseEnvelope
+from render import PULSE_BOOST, describe, frame_for
 from tt_level20 import Level20
 
 # Binding a fixed loopback port is a cheap cross-process lock: only one process
@@ -28,7 +30,7 @@ from tt_level20 import Level20
 # keyboard. The socket is never read from or written to.
 SINGLE_INSTANCE_PORT = 49731
 
-FRAME_TICK = 1 / 60          # target cadence while a pulse is decaying
+FRAME_TICK = 1 / 60          # target cadence while fading or pulsing
 RECHECK_WITH_WATCHER = 60.0  # safety re-check when change notifications work
 RECHECK_WITHOUT = 2.0        # poll interval if notifications are unavailable
 LEVEL_EPSILON = 0.02  # smallest brightness change worth a USB write
@@ -91,10 +93,14 @@ def main():
     ap.add_argument("--once", action="store_true", help="apply once and exit")
     ap.add_argument("--reactive", action="store_true",
                     help="pulse the outer frame on keypress")
-    ap.add_argument("--boost", type=float, default=0.6,
-                    help="pulse strength, 0-2 (default 0.6)")
+    ap.add_argument("--boost", type=float, default=PULSE_BOOST,
+                    help=f"pulse strength on the light strips; 0 disables, "
+                         f"~3 reaches full drive (default {PULSE_BOOST:g})")
     ap.add_argument("--decay", type=float, default=0.12,
                     help="pulse decay time constant in seconds (default 0.12)")
+    ap.add_argument("--fade", type=float, default=1.0,
+                    help="seconds to transition to a new colour; 0 snaps "
+                         "instantly (default 1.0)")
     ap.add_argument("--log", metavar="FILE",
                     help="also append output to FILE (used by the autostart entry, "
                          "which runs without a console)")
@@ -116,9 +122,9 @@ def main():
     log("keyboard opened, software mode active")
 
     source = SOURCES[args.source]
-    raw, base = read_base(source)
-    kb.set_solid(*base)
-    log(f"{args.source} {hexcolor(raw)} -> led {hexcolor(base)}")
+    raw, shown = read_base(source)
+    kb.set_leds(frame_for(shown))
+    log(f"{args.source} {hexcolor(raw)} -> {describe(shown)}")
     if args.once:
         kb.close()
         return 0
@@ -156,6 +162,7 @@ def main():
     last_token = source.token()
     last_level = 0.0
     recheck = False
+    fade = None       # active colour transition, if any
     log(f"watching {args.source} ({mode})")
 
     try:
@@ -170,37 +177,52 @@ def main():
                 current = source.token()
             else:
                 current = last_token
+            now = time.monotonic()      # also marks the start of this frame
             if current is not None and current != last_token:
                 last_token = current
                 try:
-                    raw, base = read_base(source)
-                    kb.set_solid(*base)
-                    last_level = 0.0
+                    raw, target = read_base(source)
+                    # Start from what is on the LEDs right now, so a change
+                    # that lands mid-fade redirects smoothly, never jumps.
+                    fade = Fade(shown, target, now, args.fade)
                     log(f"{args.source} changed -> {hexcolor(raw)} "
-                        f"-> led {hexcolor(base)}")
+                        f"-> {describe(target)}")
                 except Exception as exc:
                     log(f"  {args.source} update failed: {exc}")
 
-            level = envelope.level() if envelope is not None else 0.0
-            pulse_moved = (abs(level - last_level) >= LEVEL_EPSILON
-                           or level < LEVEL_EPSILON < last_level)
-            if pulse_moved:
-                lit = boost(base, level, args.boost)
-                try:
-                    kb.set_leds({i: lit for i in OUTER_FRAME})
-                    last_level = level
-                except Exception as exc:
-                    log(f"  write failed ({exc}); reconnecting")
-                    try:
-                        kb.close()
-                    except Exception:
-                        pass
-                    kb = connect()
-                    kb.set_solid(*base)
-                    last_level = 0.0
+            base_moved = False
+            if fade is not None:
+                new = fade.color_at(now)
+                base_moved, shown = new != shown, new
+                if fade.done(now):
+                    fade = None
 
-            if level >= LEVEL_EPSILON:
-                time.sleep(FRAME_TICK)          # pulse decaying: keep animating
+            level = envelope.level() if envelope is not None else 0.0
+            if level < LEVEL_EPSILON:
+                level = 0.0                     # a faint tail counts as at rest
+            pulse_moved = abs(level - last_level) >= LEVEL_EPSILON or (
+                level == 0.0 < last_level)
+            try:
+                if base_moved or pulse_moved:
+                    # Always the whole frame; set_leds only resends the reports
+                    # whose LEDs changed (3 for a pulse, 11 for a fade).
+                    kb.set_leds(frame_for(shown, level, args.boost))
+                    last_level = level
+            except Exception as exc:
+                log(f"  write failed ({exc}); reconnecting")
+                try:
+                    kb.close()
+                except Exception:
+                    pass
+                kb = connect()
+                kb.set_leds(frame_for(shown))
+                last_level = 0.0
+
+            if fade is not None or level > 0.0:
+                # Fading or pulsing: keep animating. Sleep only what is left of
+                # the frame budget - a full repaint already takes ~37ms of USB
+                # time, so a fixed sleep on top would cut the frame rate by a third.
+                time.sleep(max(0.0, FRAME_TICK - (time.monotonic() - now)))
             else:
                 # At rest: block until woken. A timeout means nothing fired
                 # for a whole interval, so re-check the colour just in case.

@@ -12,6 +12,7 @@ python sync.py                     # accent sync only
 python sync.py --source wallpaper  # follow the wallpaper instead
 python sync.py --once              # apply current colour and exit
 python sync.py --reactive --boost 0.9 --decay 0.20
+python sync.py --fade 2.5          # slower colour transitions (0 = snap)
 python accent.py                   # print accent colour and its LED version
 python wallpaper.py                # same, for the wallpaper pick
 python -m unittest test_color -v   # colour-logic tests
@@ -35,7 +36,8 @@ the process holds loopback port 49731 as a lock.
 | `leds.py`       | LED index groups (keys, logos, centre strip, outer frame) |
 | `accent.py`     | Reads the Windows accent colour from the registry |
 | `wallpaper.py`  | Finds current wallpaper, extracts a dominant colour |
-| `ledcolor.py`   | Adapts any source colour for LED display |
+| `ledcolor.py`   | Adapts any source colour for LED display; fades |
+| `render.py`     | Base colour -> per-LED frame, with per-zone gains |
 | `reactive.py`   | Keypress listener + hue-preserving pulse |
 | `watchers.py`   | Win32 change notifications (registry key / folder) |
 | `sync.py`       | Ties it together; waits for events, renders pulse |
@@ -80,10 +82,33 @@ can't be registered at all it falls back to polling every 2s.
 ### LED adaptation
 
 Every source colour passes through `normalize_for_leds()` before reaching the
-keyboard: saturation floored at 45%, brightness clamped to 55–80%. Hue is never
-changed. Dark colours look muddy on LEDs, and colours near full brightness
-leave the pulse no headroom. So the keyboard deliberately does *not* show the
-exact source value — e.g. `#69250C` is displayed as `#8C3110`.
+keyboard: saturation and brightness are floored at 45% and 55%, because dark or
+muted colours look muddy on LEDs. Hue is never changed. So the keyboard
+deliberately does *not* show the exact source value — e.g. `#69250C` is
+normalized to `#8C3110` before the per-zone gains below.
+
+The same drive level also looks very different across the board. Key LEDs sit
+under opaque keycaps, so only light escaping through the legends and gaps
+reaches the eye; the logo and light strips are bare diffusers and look bright
+and washed out. `render.frame_for()` therefore applies per-zone gains, chosen by
+eye on the real keyboard: **keys x1.5** (capped at full drive) and **logo +
+strips x0.5**. Keeping the decorative zone dim is also what gives the keypress
+pulse — which only runs on the outer frame — room to brighten visibly.
+
+### Colour transitions
+
+A new colour fades in over `--fade` seconds (default 1.0) instead of snapping.
+The path matters: consecutive accents are often near-opposite hues (rust ->
+teal), and a straight crossfade in RGB - or even perceptual OKLab - passes
+through a dull grey midway (saturation ~0.2, muddy on LEDs). Blending in OKLCh
+rotates hue along the short arc instead, so the colour stays vivid and passes
+briefly through an in-between hue. Smoothstep easing starts and ends gently.
+
+If another change arrives mid-fade, the next fade starts from whatever is on
+the LEDs at that moment, so it redirects without a jump. Each frame repaints
+the whole keyboard in one pass with the keypress pulse layered on, and frames
+are paced to a budget rather than a fixed sleep: a full repaint is ~37ms of USB
+time, so fades run at ~26fps, about the hardware ceiling.
 
 ### Reactive pulse
 

@@ -85,6 +85,7 @@ def dominant_color(path=WALLPAPER_PATH):
 
 if __name__ == "__main__":
     from ledcolor import hexcolor, normalize_for_leds
+    from render import describe
     print(f"wallpaper: {WALLPAPER_PATH}")
     raw = dominant_color()
-    print(f"dominant : {hexcolor(raw)}  ->  led: {hexcolor(normalize_for_leds(raw))}")
+    print(f"dominant : {hexcolor(raw)}  ->  {describe(normalize_for_leds(raw))}")
